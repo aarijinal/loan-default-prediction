@@ -1,9 +1,9 @@
-# loan-default-prediction
+# Loan-default-prediction
 R data analysis project
 
 This project builds predictive models to assess the likelihood of default on Small Business Administration (SBA) loans. Using a dataset of past SBA loans, we explore feature engineering, train classification models, and evaluate their performance.
 
-## Project Structure
+## project structure
 
 The project contains one folder with the following files:
 
