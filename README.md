@@ -3,11 +3,11 @@ R data analysis project
 
 This project builds predictive models to assess the likelihood of default on Small Business Administration (SBA) loans. Using a dataset of past SBA loans, we explore feature engineering, train classification models, and evaluate their performance.
 
-# Requirements
+### requirements
 
 - R and RStudio
 
-### Required packages:
+##### required packages:
 
 - tidyverse
 
