@@ -1,0 +1,621 @@
+---
+title: "Assignment 3 Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+#### Name: Amui Gayle
+
+## Data Loading
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(rsample, warn.conflicts=FALSE)
+library(yardstick, warn.conflicts=FALSE)
+library(naivebayes, warn.conflicts=FALSE)
+library(randomForest, warn.conflicts=FALSE)
+library(rpart, warn.conflicts=FALSE)
+library(pROC)
+```
+
+```{r}
+set.seed(20240401)
+```
+
+
+```{r}
+sba_raw = read_csv("SBAnational.csv")
+```
+```{r}
+glimpse(sba_raw)
+```
+
+We want to convert all the columns representing currency to doubles
+
+```{r}
+currency_convert <- function(x) {
+  x_clean <- str_replace_all(x, "[\\$,]", "")
+  as.double(x_clean)
+}
+```
+
+```{r}
+sba_raw <- sba_raw %>%
+  mutate(across(ChgOffPrinGr|GrAppv| SBA_Appv| DisbursementGross| BalanceGross , currency_convert))
+
+glimpse(sba_raw)
+```
+
+
+
+```{r}
+sba_raw = sba_raw %>%
+  mutate(UrbanRural=as.factor(case_match(
+           UrbanRural,
+           0 ~ NA,
+           1 ~ "Urban",
+           2 ~ "Rural",
+         )),
+         LowDoc=LowDoc %in% c("Y", "T"),
+         RevLineCr=RevLineCr %in% c("Y", "T"))
+
+glimpse(sba_raw)
+```
+
+
+We want to create 2 new variables. Sector, which represents the sector code extracted from NAICS and New which is determined by the values of NewExist.
+
+```{r}
+sba_raw <- sba_raw %>%
+  mutate(Sector = if_else(NAICS == 0, NA_character_, str_trunc(as.character(NAICS),2,"right",""))) %>%
+  mutate(New = as.factor(case_match(
+           NewExist,
+           0 ~ NA,
+           1 ~ "New",
+           2 ~ "Existing",
+         )),
+         Sector = as.factor(Sector))
+
+glimpse(sba_raw)
+
+```
+
+
+Now we want to create the Outcome variable as a factor so we have a target variable. 
+```{r}
+sba_raw <- sba_raw %>%
+  mutate(Outcome = if_else(MIS_Status == "CHGOFF", "Default", "PaidOff"),
+         Outcome = as.factor(Outcome))
+
+glimpse(sba_raw)
+
+```
+
+Finally we will drop all the features that are not necessary for the prediction task either because they were already transformed or they leak information.
+
+```{r}
+sba = sba_raw %>%
+  select(-NewExist) %>%
+  select(-MIS_Status, -ChgOffPrinGr, -ChgOffDate)
+```
+
+```{r}
+sba_preds = sba %>%
+  select(-LoanNr_ChkDgt, -Name, -City, -State, -Zip, -Bank, -BankState, -NAICS, -ApprovalDate)
+glimpse(sba_preds)
+```
+
+
+We will now split our data into train and test splits. 
+```{r}
+split = initial_split(sba_preds, prop=.8)
+train = training(split)
+test = testing(split)
+
+glimpse(train)
+```
+
+
+## Exploration
+
+Now we will explore our data a bit. We are curious about the distribution of our target variable. Is there imbalance? 
+
+```{r}
+ggplot(train) +
+  aes(x=Outcome) +
+  geom_bar()
+```
+We see here that there is severe imbalance in our data. We've also learned that there are some NA values in our Outcome variable so we will remove them here. 
+
+```{r}
+train <- train %>%
+  filter(!is.na(Outcome))
+```
+
+Lets explore some candidate predictors of our outcome variable. 
+
+```{r}
+
+#ggplot(train) +
+#  aes(x= LowDoc, y= mean(Outcome=="Default")) +
+#  geom_bar()
+ggplot(train) +
+  aes(x = LowDoc, y = mean(Outcome == "Default")) +
+  geom_bar(stat='identity')
+```
+
+```{r}
+
+ggplot(train) +
+  aes(x = RevLineCr, y = mean(Outcome == "Default")) +
+  geom_bar(stat='identity')
+```
+
+```{r}
+ggplot(train) +
+  aes(x = New, y = mean(Outcome == "Default" )) +
+  #geom_line() +
+  geom_bar(stat='identity')
+```
+
+
+## Model Building
+
+We want to try to accurately predict our outcome variable given some predictors so we will be experimenting with random forest and decion tree models. 
+
+First lets create our metrics set to evaluate our models.
+
+```{r}
+a3_metrics = metric_set(accuracy, sensitivity, specificity)
+```
+
+
+### Random Forest
+
+To start, we will try Random Forest. First we need to train the model.
+
+```{r}
+mod.rf = randomForest(Outcome ~
+                      ApprovalFY + Term + NoEmp + CreateJob + RetainedJob + 
+                      UrbanRural + RevLineCr + LowDoc + DisbursementDate + 
+                      DisbursementGross + BalanceGross + GrAppv + SBA_Appv + 
+                      Sector + New,
+                      train, na.action=na.omit)
+summary(mod.rf)
+```
+
+Since our model was trained omitting all NA values, we want to removes NAs from our test set before we can use it for evaluation. 
+
+```{r}
+test <- na.omit(test)
+```
+
+Now we use our Random Forest model to make predictions on our test set. We get both the class prediction and the probability scores. 
+
+```{r}
+rf.test = test %>%
+  mutate(Prediction = predict(mod.rf, test, type="class")) %>%
+  mutate(score = predict(mod.rf, test, type="prob")[, 1])
+
+glimpse(rf.test)
+```
+
+Now lets calculate our metrics
+
+```{r}
+a3_metrics(rf.test, truth=Outcome, estimate=Prediction)
+```
+With an accuracy of 0.9099347, the model correctly predicts the outcome approximately 91% of the time. A sensitivity of 0.6998859, tells us that the model correctly identifies approximately 70% of the actual positive cases and specificity of 0.9761041 tells us the model correctly identifies approximately 98% of the actual negative cases.
+
+Lets plot the AUC.
+
+```{r}
+autoplot(roc_curve(rf.test, Outcome, score))
+```
+
+```{r}
+roc_auc(rf.test, Outcome, score)
+```
+An AUC of 0.9603503 indicates that the model has a high ability to correctly distinguish between the positive and negative classes. 
+
+The performance here was not bad at all, but lets try with one more model. 
+
+### Decision Tree
+
+```{r}
+mod.dt = rpart(Outcome ~
+ApprovalFY + Term + NoEmp + CreateJob + RetainedJob + 
+                      UrbanRural + RevLineCr + LowDoc +  
+                      DisbursementGross + BalanceGross + GrAppv + SBA_Appv + 
+                      Sector + New,
+                      train, na.action=na.omit)
+```
+
+
+```{r}
+dt.test = test %>%
+  mutate(Prediction = predict(mod.dt, test, type="class")) %>%
+  mutate(score = predict(mod.dt, test, type="prob")[, 1])
+glimpse(dt.test)
+```
+
+```{r}
+a3_metrics(dt.test, truth=Outcome, estimate=Prediction)
+```
+
+Our decision tree model has a lower overall accuaracy and specificity but a slightly higher sensitivity. This tells us that our model does slightly better at predicting actual positives. 
+
+Lets examine the AUC 
+
+```{r}
+autoplot(roc_curve(dt.test, Outcome, score))
+```
+
+```{r}
+roc_auc(dt.test, Outcome, score)
+```
+Our decision tree algorithm does not do as good a job as random forest at distinguishing between positive and negative values. 
+
+## Hyperparameter Tuning
+
+So far we have been using default specifications for the models we train. We want to experiment with hyperparametee tuning to see if we can improve the performance of our models at all. 
+
+First, we will further split the train data into train and validation sets. 
+
+```{r}
+split = initial_split(train, prop=.8)
+train2 = training(split)
+val = testing(split)
+glimpse(train2)
+```
+
+For random forrest, we want to experiment with the ntree parameter. So here we will select the values of ntree we want to test as hyperparameters and create a data frame to compare the results of each of the models trained with these different values of ntree. It is important to note that the default value of ntree is 500 and so we will not be using that value as a hyperparameter since we already trained the default.
+
+```{r}
+ntree_values = c(50, 200, 800, 1000, 1300)
+
+auc_df = data.frame(trees = integer(0), auc_val = numeric(0))
+
+```
+
+Remove NAs from the validation set for good measure. 
+
+```{r}
+val = na.omit(val)
+```
+
+
+Now lwts train and evaluate the different versions of our random forest model. 
+
+```{r}
+for (i in 1:length(ntree_values)) {
+  rf_model = randomForest(Outcome ~ 
+                            ApprovalFY + Term + NoEmp + CreateJob + RetainedJob + 
+                            UrbanRural + RevLineCr + LowDoc + DisbursementDate + 
+                            DisbursementGross + BalanceGross + GrAppv + SBA_Appv + 
+                            Sector + New,
+                            train2, ntree = ntree_values[i], na.action=na.omit)
+  
+  rf_val = val %>% 
+    mutate(score = predict(rf_model, val, type="prob")[, 1])
+  rf_auc = roc_auc(rf_val, Outcome, score)$.estimate
+  auc_df = rbind(auc_df, data.frame(trees = ntree_values[i] , auc_val =rf_auc))
+  
+}
+
+glimpse(auc_df)
+```
+
+Based on our experiment, ntree = 800 had the best results for our random forest model. We will retrain a random forest model on the full training set using this parameter value, then evaluate on our full test set to compare with our default model.  
+
+```{r}
+mod.tuned_rf = randomForest(Outcome ~
+                      ApprovalFY + Term + NoEmp + CreateJob + RetainedJob + 
+                      UrbanRural + RevLineCr + LowDoc + DisbursementDate + 
+                      DisbursementGross + BalanceGross + GrAppv + SBA_Appv + 
+                      Sector + New,
+                      train, ntree = 800, na.action=na.omit)
+summary(mod.tuned_rf)
+```
+
+```{r}
+rf.tuned_test = test %>%
+  mutate(Prediction = predict(mod.tuned_rf, test, type="class")) %>%
+  mutate(score = predict(mod.tuned_rf, test, type="prob")[, 1])
+glimpse(rf.tuned_test)
+```
+
+```{r}
+a3_metrics(rf.tuned_test, truth=Outcome, estimate=Prediction)
+```
+
+When compared to our default random forest model, this tuned model did not produce any significant improvements in performance on the test set. 
+
+### dt tuning
+
+For decision tree, we will experimenting with the complexity (cp) value of the model. The parameter essentially determines the number of leaves on each tree and the default complexity is 0.01. We will follow similar steps as we did with tuning our random forest by first creating the value list and a dataframe to hold results. 
+
+```{r}
+cp_values = c(0.001, 0.1, 0.2, 0.5, 1)
+
+auc_df = data.frame(depth = integer(0), auc_val = numeric(0))
+
+```
+
+
+
+```{r}
+for (i in 1:length(cp_values)) {
+  dt_model = rpart(Outcome ~ 
+                      ApprovalFY + Term + NoEmp + CreateJob + RetainedJob + 
+                      UrbanRural + RevLineCr + LowDoc +  
+                      DisbursementGross + BalanceGross + GrAppv + SBA_Appv + 
+                      Sector + New,
+                      train2, cp = cp_values[i], na.action=na.omit )
+  dt_val = val %>% 
+    mutate(score = predict(dt_model, val, type="prob")[, 1])
+  dt_auc = roc_auc(dt_val, Outcome, score)$.estimate
+  auc_df = rbind(auc_df, data.frame(depth = cp_values[i] , auc_val =dt_auc))
+  
+}
+
+glimpse(auc_df)
+
+```
+The complexity value cp= 0.001 produced the highest AUC score on our validation set and so we will retrain a full model using this parameter value. 
+
+```{r}
+mod.tuned_dt = rpart(Outcome ~ 
+                      ApprovalFY + Term + NoEmp + CreateJob + RetainedJob + 
+                      UrbanRural + RevLineCr + LowDoc +  
+                      DisbursementGross + BalanceGross + GrAppv + SBA_Appv + 
+                      Sector + New,
+                      train, cp = 0.001, na.action=na.omit)
+
+```
+
+
+```{r}
+dt.tuned_test = test %>%
+  mutate(Prediction = predict(mod.tuned_dt, test, type="class")) %>%
+  mutate(score = predict(mod.tuned_dt, test, type="prob")[, 1])
+glimpse(dt.tuned_test)
+```
+
+```{r}
+a3_metrics(dt.tuned_test, truth=Outcome, estimate=Prediction)
+```
+
+Our tuned decision tree model performed better than our default model, with improvements in all 3 metrics. The biggest improvement was observed in sensitivity, which jumped from 71% to 81%. This means our tuned model is significantly better at identifying our positive class. 
+
+
+## Importance and fairness
+
+### Importance
+
+We want to examine what features were most important in predicting our outcome variable in our default random forest model. 
+
+```{r}
+importance(mod.rf)
+```
+The Sector, Disbursement amount and date are some of the most important predictors in our random forest model. These features differ from those we identified as candidate predictors previously. 
+
+
+### Fairness
+
+Lets determine if our model unfairly penalizes new businesses.
+
+First will bind the results of all our test sets for default models together.
+
+```{r}
+all.results = bind_rows(
+rf.test %>% select(Outcome, Prediction, New, score) %>% mutate(model="RandomForest"),
+dt.test %>% select(Outcome, Prediction, New, score) %>% mutate(model="Tree")
+) %>% glimpse()
+
+```
+
+We will evaluate precision, sensitivity and fpr (1-specificity) of each model broken down by new and existing businesses. 
+
+```{r}
+fair_metrics = metric_set(precision, sensitivity, specificity)
+
+all.metrics = all.results %>%
+group_by(model, New) %>%
+fair_metrics(truth=Outcome, estimate=Prediction)
+
+all.metrics %>% pivot_wider(names_from=.metric, values_from=.estimate)
+```
+
+We will now calculate the AUC across new and exuisting businesses as well. 
+
+```{r}
+all.auc = all.results %>%
+group_by(model, New) %>%
+  roc_auc(Outcome, score)
+glimpse(all.metrics)
+
+all.auc %>% pivot_wider(names_from=.metric, values_from=.estimate)
+```
+
+To determine if any model is unfairly penalizing new businesses, we need to compare the performance metrics between new and existing businesses for each model. Both models have higher sensitivity and specificity for new businesses compared to existing businesses. The Random Forest model generally performs better in terms of sensitivity and specificity for both existing and new businesses compared to the Decision Tree model. The AUC values are higher for new businesses in both models with random forest having higher values than decision tree overall.  Based on this, there's no clear evidence that any of the models are unfairly penalizing new businesses. 
+
+
+My main take-away from this asignment is the importance of hyperparameter tuning. These parameters can make the difference between a good model and a bad model for your machine learning tasks.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+unique(sba_raw$NewExist)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
